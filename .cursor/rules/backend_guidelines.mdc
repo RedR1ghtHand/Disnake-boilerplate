@@ -1,0 +1,352 @@
+---
+alwaysApply: false
+---
+# Discord Bot Architecture Guidelines
+
+## Tech Stack
+
+- **Discord API**: Disnake
+- **Database**: PyMongo (MongoDB)
+- **Config**: pydantic-settings (`.env`)
+- **Package Manager**: UV
+- **Testing**: Pytest
+
+## Project Structure
+
+```
+discord-bot-boilerplate/
+├── main.py                     # Entry point → setup_logging() → run_bot()
+├── Dockerfile
+├── docker-compose.yml          # bot only (Atlas / external MongoDB)
+├── docker-compose.local.yml    # optional local MongoDB overlay
+├── .env                        # Secrets (gitignored)
+├── .env.example                # Env template (committed)
+├── tests/
+│   ├── conftest.py             # Shared fixtures
+│   ├── test_*.py               # Unit tests (flat, mirror bot modules)
+│   ├── integration/            # MongoDB, full flows
+│   └── factories/              # Test data builders
+└── bot/
+    ├── core.py                 # Bot instance + lifecycle
+    ├── log.py                  # Logging setup
+    ├── config/
+    │   ├── settings.py         # Env vars, secrets, infrastructure
+    │   ├── intents.py          # Discord gateway intents
+    │   └── guilds.py           # Allowed guild IDs
+    ├── commands/               # Slash commands, listeners, cogs
+    ├── services/               # Business logic
+    ├── ui/                     # Embeds, views, modals, templates
+    └── db/
+        ├── base.py             # Shared DB primitives
+        ├── session.py          # MongoDB client / connection
+        ├── models/             # Document schemas
+        ├── repositories/       # Data access (CRUD, queries)
+        └── migrations/         # Index setup, schema migrations
+```
+
+## Layer Responsibilities
+
+| Layer | Location | Does | Does NOT |
+|-------|----------|------|----------|
+| Entry | `main.py` | Start the bot | Contain logic |
+| Core | `bot/core.py` | Bot singleton, `run_bot()`, load extensions | Define commands or queries |
+| Commands | `bot/commands/` | Handle Discord interactions | Direct DB access, complex logic |
+| Services | `bot/services/` | Business rules, orchestration | Discord UI, raw queries |
+| UI | `bot/ui/` | Embeds, views, modals, reply text | Business logic, DB access |
+| Repositories | `bot/db/repositories/` | CRUD and queries | Business rules, Discord code |
+| Models | `bot/db/models/` | Document shape / collection mapping | Queries or validation logic |
+| Config | `bot/config/` | Static deployment settings | Runtime per-guild data |
+
+## Request Flow
+
+```
+Discord interaction
+  → bot/commands/       parse input, check permissions
+  → bot/services/       apply business rules
+  → bot/db/repositories/  read/write data
+  → bot/ui/             build embed/view response
+  → Discord reply
+```
+
+## Config
+
+### settings.py
+- Loads from `.env` via pydantic-settings
+- Holds secrets (`BOT_TOKEN`), infrastructure (`MONGODB_URI`), and privileged intent flags
+- Access via `from bot.config import settings`
+
+### intents.py
+- Builds `disnake.Intents` in code - do not env-var every intent
+- Privileged intents (`members`, `presences`, `message_content`) read flags from settings
+- Must also be enabled in the Discord Developer Portal
+
+### guilds.py
+- `get_allowed_guild_ids()` - reads guild IDs from `ALLOWED_GUILDS` env var
+- `get_allowed_guilds()` - same, returns `None` when empty
+- Passed to Disnake as `test_guilds` for instant slash-command sync during development
+- Set to empty in production for global command registration
+
+## Logging
+
+Colored, category-aware logging via `bot/log.py`. Categories are inferred from module path or set explicitly.
+
+| Category | Color | Module prefix |
+|----------|-------|---------------|
+| `commands` | cyan | `bot.commands.*` |
+| `services` | green | `bot.services.*` |
+| `db` | yellow | `bot.db.*` |
+| `ui` | magenta | `bot.ui.*` |
+| `core` | blue | `bot.core` |
+| `config` | white | `bot.config.*` |
+
+### Setup
+
+- Call `setup_logging()` once in `main.py` before `run_bot()`
+- Set level via `LOG_LEVEL` env var (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
+
+### Manual logging
+
+```python
+from bot.log import get_logger
+
+logger = get_logger(__name__)  # category auto-detected from module path
+
+logger.info("Guild settings loaded")
+logger.event("embed sent")  # semantic alias for info
+```
+
+### Decorators
+
+```python
+from bot.log import log_command, log_db, log_service, log_ui, logged
+
+@log_command()
+async def help_command(inter):
+    ...
+
+@log_service()
+async def get_guild_settings(guild_id: int):
+    ...
+
+@log_db()
+async def find_guild(guild_id: int):
+    ...
+
+@log_ui("help embed sent")
+async def send_help_embed(inter, embed):
+    await inter.response.send_message(embed=embed)
+
+@logged(category="ui", action="confirm view opened", level=logging.INFO)
+async def open_confirm_view(inter):
+    ...
+```
+
+- `@log_command` / `@log_service` / `@log_db` / `@log_ui` — shorthand for each layer
+- `action=` replaces generic `→ func_name` with a readable message (ideal for UI events)
+- Logs entry (`>`) and success (`done:`), exceptions on failure (`!`)
+- Works with sync and async functions
+
+- Do not call `logging.basicConfig()` outside `bot/log.py`
+- Disnake HTTP loggers are downgraded to `WARNING` by default
+- Run `uv run python main.py --demo-only` to preview all colors and decorators
+- Run `uv run python main.py --demo-logging` to demo logs, then start the bot
+
+## Commands
+
+- One file per feature or cog (e.g. `bot/commands/help.py`)
+- Register with the bot in `core.py` or via extension loading
+- Keep commands thin: validate input → call service → return UI response
+
+```python
+from bot.core import bot
+from bot.services.guild import guild_service
+from bot.ui.embeds import build_help_embed
+
+@bot.slash_command()
+async def help(inter: disnake.ApplicationCommandInteraction):
+    data = await guild_service.get_settings(inter.guild_id)
+    await inter.response.send_message(embed=build_help_embed(data))
+```
+
+## Services
+
+- One service per domain (e.g. `GuildService`, `UserService`)
+- Called by commands; calls repositories
+- No Disnake types in return values when avoidable - return plain data/schemas
+
+## UI
+
+- **Embeds**: `bot/ui/embeds/`
+- **Views / modals**: `bot/ui/views/`
+- **Plain text templates**: `bot/ui/messages.py` or `bot/ui/templates/`
+- UI modules receive data and return Discord objects - no DB or business logic
+
+## Database
+
+### MongoDB conventions
+- Use `bot/db/session.py` for client and database handle
+- Store Discord snowflakes as `int` (use `discord_id` field name, not `id`)
+- Collection names: plural snake_case (`guild_settings`, `user_profiles`)
+
+### Repositories
+- One repository per collection/domain
+- Methods named by action: `get_by_guild_id`, `upsert`, `delete_by_id`
+- Accept plain types; return models or dicts
+
+### Migrations
+- Index creation and one-off schema changes go in `bot/db/migrations/`
+- Run on startup or via a CLI command - not inside command handlers
+
+## Environment Setup
+
+```bash
+cp .env.example .env   # fill in BOT_TOKEN and other values
+uv sync
+uv run python main.py
+
+# Preview all log colors and decorators (no bot connection)
+uv run python main.py --demo-only
+
+# Demo logging, then connect with your test bot
+uv run python main.py --demo-logging
+```
+
+Required env vars:
+- `BOT_TOKEN` - Discord bot token (required)
+- `ALLOWED_GUILDS` - comma-separated guild IDs for dev command sync
+- `MONGODB_URI`, `MONGODB_DATABASE` - MongoDB connection
+
+## Docker
+
+Two compose files — use the one that matches your MongoDB setup.
+
+| File | Use when |
+|------|----------|
+| `docker-compose.yml` | MongoDB Atlas or any external URI in `.env` |
+| `docker-compose.local.yml` | Self-hosted MongoDB container (overlay) |
+
+### Atlas / external MongoDB (default)
+
+Set `MONGODB_URI` in `.env` to your Atlas connection string:
+
+```env
+MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/
+```
+
+```bash
+docker compose up --build
+docker compose up -d
+docker compose logs -f bot
+docker compose down
+```
+
+### Local MongoDB in Docker (optional overlay)
+
+Adds a `mongo` service and overrides `MONGODB_URI` to `mongodb://mongo:27017`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.local.yml down
+docker compose -f docker-compose.yml -f docker-compose.local.yml down -v   # + wipe volume
+```
+
+### Notes
+
+- `.env` is loaded via `env_file` — never bake secrets into the image
+- With the default compose file, `MONGODB_URI` comes entirely from `.env` (Atlas, localhost, etc.)
+- Local overlay exposes MongoDB on port `27017` for Compass / mongosh
+- Uses `uv sync --frozen` for reproducible installs from `uv.lock`
+- Bot restarts automatically (`unless-stopped`)
+
+## Naming Conventions
+
+| Item | Style | Example |
+|------|-------|---------|
+| Modules | snake_case | `guild_settings.py` |
+| Classes | PascalCase | `GuildService`, `GuildRepository` |
+| Functions | snake_case | `get_allowed_guilds`, `build_intents` |
+| Constants | UPPER_SNAKE | `LOG_FORMAT` |
+| Discord snowflake fields | `discord_id` suffix | `guild_discord_id` |
+| Collections | plural snake_case | `guild_settings` |
+
+## Import Order
+
+```python
+# 1. Standard library
+from functools import lru_cache
+
+# 2. Third-party
+import disnake
+from pydantic_settings import BaseSettings
+
+# 3. Local (absolute)
+from bot.config import settings
+from bot.db.repositories.guild import GuildRepository
+
+# 4. Relative (within same package only)
+from .embeds import build_help_embed
+```
+
+## Code Style
+
+- Use type hints on all public functions
+- Prefer absolute imports (`from bot.config import settings`)
+- Add a one-line module docstring at the top of every file
+- No business logic in `core.py`, commands, repositories, or UI modules
+- Keep commands and UI testable by pushing logic into services
+
+## Testing
+
+### Structure
+
+```
+tests/
+├── conftest.py           # autouse fixtures (settings cache reset, bot_env)
+├── test_*.py             # unit tests — flat, no external services
+├── integration/          # requires MongoDB or other running services
+└── factories/            # reusable test data builders
+```
+
+### Conventions
+
+- Name files `test_<module>.py` directly in `tests/` (e.g. `tests/test_guild_service.py`)
+- Use the `bot_env` fixture to set required env vars (`BOT_TOKEN`, etc.)
+- Call `get_settings.cache_clear()` after changing env vars in a test
+- Test services and repositories directly — no mocking at those layers
+- Mock Disnake interactions only in command-layer tests
+- Use `tests/factories/` for document builders as models grow
+- Put tests needing MongoDB or other services in `tests/integration/`
+
+### Running tests
+
+```bash
+uv sync --group dev
+uv run pytest
+uv run pytest tests/test_guild_service.py -v
+```
+
+### What to test where
+
+| Layer | Test type | Location |
+|-------|-----------|----------|
+| Config, services, commands | unit | `tests/test_*.py` |
+| Repositories, full flows | integration | `tests/integration/` |
+
+## What Goes Where (Quick Reference)
+
+```
+Need to...                          → Put it in...
+Add a slash command                 → bot/commands/
+Add business logic                  → bot/services/
+Build an embed or button view       → bot/ui/
+Add a MongoDB collection schema     → bot/db/models/
+Add a database query                → bot/db/repositories/
+Add an env variable                 → bot/config/settings.py + .env.example
+Change Discord intents              → bot/config/intents.py
+Add a dev guild ID                  → .env ALLOWED_GUILDS → bot/config/guilds.py
+Configure logging                   → bot/log.py + LOG_LEVEL in .env
+Load a cog / start the bot          → bot/core.py
+Write a unit test                   → tests/test_<feature>.py
+Write an integration test           → tests/integration/
+```
